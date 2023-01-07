@@ -1,0 +1,227 @@
+---
+title: "Differential Analysis"
+output: html_document
+---
+
+```{r}
+library(tximport)
+library(tximportData)
+library(readr)
+```
+
+```{r}
+repository = "candida-infection-pipeline"
+
+# For RStudio only
+current_dir = dirname(rstudioapi::getActiveDocumentContext()$path)
+dir = strsplit(current_dir, repository)[[1]][1]
+
+samples_data = read.table(file.path(dir, repository, "metadata/SraRunTable.txt"), header = TRUE, sep = ",")
+
+tx2gene_file = read_csv(file.path(paste0(dir, repository, "/results/transcript_to_gene.csv")))
+head(tx2gene_file, n = 3)
+```
+
+```{r}
+isoform_files = file.path(dir, paste0("rsem_results/expression/mm/mm_", samples_data$Run, ".1_quals.isoforms.results"))
+all(file.exists(isoform_files))
+
+names(isoform_files) = paste0("sample", 1:19)
+isoform_estimates = tximport(isoform_files, type = "rsem", tx2gene = tx2gene_file)
+head(isoform_estimates$counts, n = 3)
+```
+
+```{r}
+library(DESeq2)
+```
+
+```{r}
+dds_import = DESeqDataSetFromTximport(isoform_estimates, colData = samples_data, design = ~ Condition)
+nrow(dds_import)
+```
+
+Filtering genes
+```{r}
+keep = rowSums(counts(dds_import)) >= 10 
+dds_filter = dds_import[keep, ]
+
+nrow(dds_filter)
+dds = DESeq(dds_filter)
+resultsNames(dds)
+```
+
+## Results
+```{r}
+res = results(dds, contrast = c("Condition", "Disease", "Control"))
+res = res[order(res$padj),]
+mcols(res)$description
+summary(res)
+
+res_df = as.data.frame(res)
+```
+```{r}
+write.csv(as.data.frame(res_df), row.names = TRUE, quote = FALSE, file = paste0(dir, repository, "/results/deseq_results.csv"))
+```
+
+### Filtering results
+- Significantly differentially expressed genes 
+```{r}
+res_sig = subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+summary(res_sig)
+result_sig_df = as.data.frame(res_sig)
+```
+```{r}
+result_sig_genes = row.names(res_sig)
+keep_genes = is.element(rownames(isoform_estimates$abundance), result_sig_genes)
+dds_filter = dds_import[keep_genes,]
+dds_sig = DESeq(dds_filter)
+vsd = vst(dds, blind = FALSE)
+vsd_sig = vst(dds_sig, blind = FALSE)
+```
+
+## Data Visualization
+
+### MA plot
+```{r}
+plotMA(res, ylim = c(-10, 10))
+
+#idx = identify(res_sig$baseMean, res_sig$log2FoldChange) #Select genes
+#rownames(res_sig)[idx] #Selected genes
+```
+
+Sig
+```{r}
+plotMA(res_sig, ylim = c(-10, 10))
+```
+
+### Dispersion plot
+```{r}
+plotDispEsts( dds, ylim = c(1e-6, 1e1) )
+head(assay(vsd), 3)
+```
+
+### Sample distance 
+
+```{r}
+library("pheatmap")
+library("RColorBrewer")
+
+sample_dists = dist(t(assay(vsd)))
+sampleDistMatrix = as.matrix(sample_dists)
+rownames(sampleDistMatrix) = paste(vsd$Condition, sep = "-")
+colnames(sampleDistMatrix) = NULL
+colors = colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sample_dists,
+         clustering_distance_cols = sample_dists,
+         col = colors)
+```
+
+Sig
+```{r}
+sample_dists = dist(t(assay(vsd_sig)))
+sampleDistMatrix = as.matrix(sample_dists)
+rownames(sampleDistMatrix) = paste(vsd_sig$Condition, sep = "-")
+colnames(sampleDistMatrix) = NULL
+colors = colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sample_dists,
+         clustering_distance_cols = sample_dists,
+         col = colors)
+```
+
+### PCA 
+```{r}
+plotPCA(vsd, intgroup = c("Condition", "LibraryLayout"))
+plotPCA(vsd_sig, intgroup = c("Condition", "LibraryLayout"))
+```
+
+```{r}
+library("pheatmap")
+
+#rld = rlog(dds, blind = FALSE)
+select = order(rowMeans(counts(dds, normalized = TRUE)),
+                decreasing = TRUE)#[1:5972]
+df = as.data.frame(colData(dds)[, c("Condition", "LibraryLayout")])
+
+pheatmap(assay(vsd)[select,], cluster_rows = FALSE, show_rownames = FALSE,
+         cluster_cols = FALSE, annotation_col = df)
+```
+
+
+### Gene expression - bar plot
+```{r}
+library(knitr)
+
+#ix = which.min(res$padj)
+ix = "ENSMUSG00000053528"
+barplot(assay(dds)[ix, ], las = 2, main = rownames(dds)[ix])
+```
+
+### Gene expression - counts
+```{r}
+plotCounts(dds, gene = ix, intgroup = "Condition")
+```
+
+## Additional information
+
+### Differentially expressed genes
+```{r}
+library("biomaRt")
+
+#listMarts()
+mart = useMart("ensembl")
+#datasets = listDatasets(mart)
+ensembl = useDataset("mmusculus_gene_ensembl", mart = mart)
+
+complement = getBM(filters = "ensembl_gene_id",
+                    attributes = c("ensembl_gene_id", "description", "external_gene_name", "gene_biotype"),
+                      values = result_sig_genes, mart = ensembl)
+table(complement$gene_biotype)
+#attributes = listAttributes(ensembl)
+
+final_sig_df = merge(complement, result_sig_df, by.x = "ensembl_gene_id", by.y = 0, sort = FALSE)
+sig_lncrna = subset(final_sig_df, gene_biotype == "lncRNA")
+```
+Exporting results 
+```{r}
+write.csv(as.data.frame(final_sig_df), row.names = FALSE, file = paste0(dir, repository, "/results/deseq_sig.csv"))
+write.csv(as.data.frame(sig_lncrna), row.names = FALSE, file = paste0(dir, repository, "/results/deseq_sig_lncrna.csv"))
+```
+
+### All genes
+```{r}
+complement_total = getBM(filters = "ensembl_gene_id",
+                   attributes = c("ensembl_gene_id", "description", "external_gene_name", "gene_biotype"),
+                   values = row.names(res), mart = ensembl)
+table(complement_total$gene_biotype)
+
+final_df = merge(complement_total, res_df, by.x = "ensembl_gene_id", by.y = 0, sort = FALSE)
+lncrna_res = subset(final_df, gene_biotype == "lncRNA")
+```
+
+Exporting results 
+```{r}
+write.csv(as.data.frame(lncrna_res), row.names = FALSE, file = paste0(dir, repository, "/results/deseq_lncrna.csv"))
+write.csv(as.data.frame(final_df), row.names = FALSE, file = paste0(dir, repository, "/results/deseq_total.csv"))
+```
+
+## Expression Matrix
+```{r}
+matrix = assay(vsd)
+write.csv(as.data.frame(matrix), row.names = TRUE, quote = FALSE, file = paste0(dir, repository, "/results/expression_matrix.csv"))
+```
+
+```{r}
+condition = t(samples_data$Condition)
+names(condition) = paste0("sample", 1:19)
+
+t_matrix = t(rbind(condition, matrix))
+matrix_sig = assay(vsd_sig)
+t_matrix_sig = t(rbind(condition, matrix_sig))
+```
+
+```{r}
+write.csv(as.data.frame(t_matrix), row.names = TRUE, quote = FALSE, file = paste0(dir, repository, "/results/expressao_", dim(vsd)[1],".csv"))
+write.csv(as.data.frame(t_matrix_sig), row.names = TRUE, quote = FALSE, file = paste0(dir, repository, "/results/expressao_", dim(vsd_sig)[1], ".csv"))
+```
